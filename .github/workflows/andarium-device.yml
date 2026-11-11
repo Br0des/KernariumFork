@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Build Andarium's device application on a GitHub-hosted macOS runner.
+#
+# The accepted kernel bundle and the accepted Android release are not in this
+# repository, and no hosted runner can produce them (the release needs the
+# LineageOS builder and its signing keys). Publish each one as a .tar.zst asset
+# and set the four repository variables (or the workflow_dispatch inputs):
+#
+#   ANDARIUM_KERNEL_ARTIFACT_URL / _SHA256
+#       archive holding <UML_KERNEL_ARTIFACT_DIRECTORY_NAME>/ from
+#       kernel/mainline-6.18/artifacts/accepted-android-4k.env
+#   ANDARIUM_ANDROID_RELEASE_URL / _SHA256
+#       archive holding <LINEAGE24_ACCEPTED_DIRECTORY_NAME>/ from
+#       android/lineage-24/metadata/accepted-release.env
+#
+# The job builds the verified dependency prefixes from their pinned public
+# sources, then the Android runtime and frameworks, stages the accepted system
+# image and compiles the Andarium target.
+name: Andarium device app
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_artifact_url:
+        description: Accepted kernel bundle (.tar.zst)
+        required: false
+      kernel_artifact_sha256:
+        description: SHA-256 of the kernel bundle archive
+        required: false
+      android_release_url:
+        description: Accepted Android release (.tar.zst)
+        required: false
+      android_release_sha256:
+        description: SHA-256 of the Android release archive
+        required: false
+  push:
+    branches:
+      - ci/andarium-device
+
+permissions:
+  contents: read
+
+concurrency:
+  group: andarium-device-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  device:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      ANDARIUM_KERNEL_ARTIFACT_URL: ${{ github.event.inputs.kernel_artifact_url || vars.ANDARIUM_KERNEL_ARTIFACT_URL }}
+      ANDARIUM_KERNEL_ARTIFACT_SHA256: ${{ github.event.inputs.kernel_artifact_sha256 || vars.ANDARIUM_KERNEL_ARTIFACT_SHA256 }}
+      ANDARIUM_ANDROID_RELEASE_URL: ${{ github.event.inputs.android_release_url || vars.ANDARIUM_ANDROID_RELEASE_URL }}
+      ANDARIUM_ANDROID_RELEASE_SHA256: ${{ github.event.inputs.android_release_sha256 || vars.ANDARIUM_ANDROID_RELEASE_SHA256 }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Check the accepted inputs are published
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${ANDARIUM_KERNEL_ARTIFACT_URL:-}" ] || missing="$missing ANDARIUM_KERNEL_ARTIFACT_URL"
+          [ -n "${ANDARIUM_KERNEL_ARTIFACT_SHA256:-}" ] || missing="$missing ANDARIUM_KERNEL_ARTIFACT_SHA256"
+          [ -n "${ANDARIUM_ANDROID_RELEASE_URL:-}" ] || missing="$missing ANDARIUM_ANDROID_RELEASE_URL"
+          [ -n "${ANDARIUM_ANDROID_RELEASE_SHA256:-}" ] || missing="$missing ANDARIUM_ANDROID_RELEASE_SHA256"
+          if [ -n "$missing" ]; then
+            echo "::error::Accepted artifacts are not published to CI:$missing"
+            exit 1
+          fi
+
+      - name: Restore the dependency prefixes
+        id: dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/sources
+            .build/dependency-cache
+            .build/dependencies
+          key: andarium-device-dependencies-v1-${{ hashFiles('dependencies/**') }}
+          restore-keys: |
+            andarium-device-dependencies-v1-
+
+      - name: Build the verified dependency prefixes
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 -m venv .build/gpu-tools-venv
+          .build/gpu-tools-venv/bin/pip install --quiet --upgrade pip
+          .build/gpu-tools-venv/bin/pip install --quiet meson mako packaging pyyaml
+          xcodebuild -downloadComponent MetalToolchain
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install autoconf automake libtool gperf groff gettext pkg-config bison flex
+          jobs=$(sysctl -n hw.logicalcpu)
+          dependencies/prepare.sh --product ios-network
+          dependencies/prepare.sh --product ios-storage
+          dependencies/prepare.sh --product ios-compression
+          dependencies/prepare.sh --product apple-gpu-vulkan-experiment
+          dependencies/build-apple-gpu.sh --platform ios \
+            --prefix "$PWD/.build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64" \
+            --jobs "$jobs"
+          dependencies/build-ios-network.sh --platform ios \
+            --prefix "$PWD/.build/dependencies/ios-device-arm64/network" \
+            --jobs "$jobs"
+          dependencies/build-ios-storage.sh
+          dependencies/build-ios-zstd.sh
+          touch .build/dependencies/.andarium-ci-ready
+
+      - name: Fetch the accepted kernel bundle and Android release
+        run: |
+          set -euo pipefail
+          kernel_name=$(sed -n "s/^UML_KERNEL_ARTIFACT_DIRECTORY_NAME='\([^']*\)'$/\1/p" \
+            kernel/mainline-6.18/artifacts/accepted-android-4k.env)
+          release_name=$(sed -n "s/^LINEAGE24_ACCEPTED_DIRECTORY_NAME='\([^']*\)'$/\1/p" \
+            android/lineage-24/metadata/accepted-release.env)
+          if [ -z "$kernel_name" ] || [ -z "$release_name" ]; then
+            echo "::error::The accepted artifact descriptors do not name their directories"
+            exit 1
+          fi
+          mkdir -p .build/kernel/artifacts .build/android/releases
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/andarium-kernel.tar.zst" "$ANDARIUM_KERNEL_ARTIFACT_URL"
+          printf '%s  %s\n' "$ANDARIUM_KERNEL_ARTIFACT_SHA256" "$RUNNER_TEMP/andarium-kernel.tar.zst" \
+            > "$RUNNER_TEMP/andarium-kernel.sha256"
+          shasum --algorithm 256 --check "$RUNNER_TEMP/andarium-kernel.sha256"
+          zstd --decompress --stdout "$RUNNER_TEMP/andarium-kernel.tar.zst" |
+            tar --extract --file - --directory .build/kernel/artifacts
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/andarium-release.tar.zst" "$ANDARIUM_ANDROID_RELEASE_URL"
+          printf '%s  %s\n' "$ANDARIUM_ANDROID_RELEASE_SHA256" "$RUNNER_TEMP/andarium-release.tar.zst" \
+            > "$RUNNER_TEMP/andarium-release.sha256"
+          shasum --algorithm 256 --check "$RUNNER_TEMP/andarium-release.sha256"
+          zstd --decompress --stdout "$RUNNER_TEMP/andarium-release.tar.zst" |
+            tar --extract --file - --directory .build/android/releases
+          [ -d ".build/kernel/artifacts/$kernel_name" ] || {
+            echo "::error::The kernel archive holds no $kernel_name directory"
+            exit 1
+          }
+          [ -d ".build/android/releases/$release_name" ] || {
+            echo "::error::The release archive holds no $release_name directory"
+            exit 1
+          }
+
+      - name: Build the Android runtime and frameworks
+        run: |
+          set -euo pipefail
+          cmake --preset kernarium-ios-device-android
+          cmake --build --preset kernarium-ios-device-android
+          Kernarium/scripts/package-ios-frameworks.sh --runtimes android
+
+      - name: Stage the system image and build the device application
+        run: |
+          set -euo pipefail
+          Andarium/scripts/stage-system-image.py
+          xcodebuild \
+            -project Andarium/Andarium.xcodeproj \
+            -scheme Andarium \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/andarium-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
