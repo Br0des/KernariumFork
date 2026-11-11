@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Compile what a clean checkout carries: the Simulator preview built from the
+# shared and preview sources. The device application also needs the verified
+# dependency prefixes, the accepted kernel bundle and the accepted Android
+# release, which are not in this repository.
+name: Andarium Simulator preview
+
+on:
+  push:
+    paths:
+      - 'Andarium/**'
+      - 'GuestHost/**'
+      - '.github/workflows/andarium.yml'
+  pull_request:
+    paths:
+      - 'Andarium/**'
+      - 'GuestHost/**'
+      - '.github/workflows/andarium.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: andarium-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-simulator-preview:
+    # Andarium targets iOS 27, so the job needs the Xcode 27 image.
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Build AndariumPreview for the Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild \
+            -project Andarium/Andarium.xcodeproj \
+            -scheme AndariumPreview \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/andarium-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
